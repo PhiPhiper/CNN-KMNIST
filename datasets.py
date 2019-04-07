@@ -1,6 +1,19 @@
+##################################################
+## Solving the KMNIST Classifation task with smac
+## to do some execise
+##################################################
+## 
+##################################################
+## Author: Philipp Jankov
+## Copyright: Copyright 2019, Philipp Jankov
+## Credits: KMNIST class was kindly provided
+##          by Marius Lindauer
+##################################################
+
 import os
 
 import requests
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,6 +26,17 @@ from torchvision import transforms
 
 import matplotlib.pyplot as plt
 import torchvision
+
+# Import ConfigSpace and different types of parameters
+from smac.configspace import ConfigurationSpace
+from ConfigSpace.hyperparameters import CategoricalHyperparameter, \
+    UniformFloatHyperparameter, UniformIntegerHyperparameter
+from ConfigSpace.conditions import InCondition
+
+# Import SMAC-utilities
+from smac.tae.execute_func import ExecuteTAFuncDict
+from smac.scenario.scenario import Scenario
+from smac.facade.smac_facade import SMAC
 
 class KMNIST(Dataset):
     """
@@ -209,6 +233,7 @@ def train(model, loss_fn, optimizer, trainset, valset, batchsize):
     alpha = 0.9
     epoch = 0
     while(True):
+        start = time.time()
         epoch += 1
         print("Epoch {}".format(epoch))
         if epoch > train_loss.shape[0]:
@@ -261,36 +286,89 @@ def train(model, loss_fn, optimizer, trainset, valset, batchsize):
         # Calc exponential moving average for the current epoch
         valacc_ema_q.appendleft(valacc_ema_q[0] + alpha * (val_accuracies[epoch - 1] - valacc_ema_q[0]) if epoch > 1 else val_accuracies[epoch - 1])
         print("  Validation Loss (EMA):\t{:.4f}".format(valacc_ema_q[0]))
+        print("  This epoch took\t{:.4f}s".format(time.time()-start))
         if epoch > valacc_ema_q.maxlen and valacc_ema_q[0] - valacc_ema_q[-1] < 5.*1e-3:
            break
 
     return train_loss[:epoch], train_accuracies[:epoch], val_loss[:epoch], val_accuracies[:epoch]
 
-def run_config(lr, dropout_p):
-    # Define dataset
-    kmnist = KMNIST()
-    # Define the network params
-    filter_shape = (4, 4)
-    stride = (1, 1)
-    myCNN = MyCNN((kmnist.img_cols, kmnist.img_rows), kmnist.channels, kmnist.n_classes, filter_shape, stride, dropout_p)
-    if torch.cuda.is_available(): myCNN.cuda()
-    # Define loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(myCNN.parameters(), lr=lr)
+class smaced():
+    def __init__(self):
+        self.min_validationerror = float('Inf')
+        self.saved_model = None
+        self.history = None
+        self.criterion = nn.CrossEntropyLoss()
+        self.test_score = None
+
+    def run_smac_config(self, cfg):
+        return self.run_config(**cfg)
+
+    def run_config(self, lr, dropout_p):
+        # Define dataset
+        kmnist = KMNIST()
+        # Define the network params
+        filter_shape = (4, 4)
+        stride = (1, 1)
+        myCNN = MyCNN((kmnist.img_cols, kmnist.img_rows), kmnist.channels, kmnist.n_classes, filter_shape, stride, dropout_p)
+        if torch.cuda.is_available(): myCNN.cuda()
+        # Define loss and optimizer
+        optimizer = optim.Adam(myCNN.parameters(), lr=lr)
 
 
-    # Split data
-    trainset, valset, testset = torch.utils.data.random_split(kmnist, split_ratio_to_lengths(len(kmnist), (.7, .15, .15)))
-    tl, ta, vl, va = train(myCNN, criterion, optimizer, trainset, valset, 500) # <- 1000 was too big for my 8GB GPU
-    return (1-va[-1])
+        # Split data
+        trainset, valset, testset = torch.utils.data.random_split(kmnist, split_ratio_to_lengths(len(kmnist), (.7, .15, .15)))
+        tl, ta, vl, va = train(myCNN, self.criterion, optimizer, trainset, valset, 500) # <- 1000 was too big for my 8GB GPU
+        if (1-va[-1]) < self.min_validationerror:
+            self.min_validationerror = (1-va[-1])
+            self.saved_model = myCNN
+            self.history = np.vstack((tl, ta, vl, va)).T
+            self.test_score = (self.test(testset))
+        return (1-va[-1])
+
+    def test(self, dset):
+        test_loader = DataLoader(dset, batch_size=500, pin_memory=True, shuffle=True)
+        test_true, test_predictions = [], []
+        test_loss = 0
+        test_accuracies = 0
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.saved_model.eval()
+        for x_batch, y_batch in iter(test_loader):
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+
+            y_batch_predicted = self.saved_model(x_batch)
+            loss = self.criterion(y_batch_predicted, y_batch)
+
+            test_loss += float(loss)
+            test_true.append(np.array(y_batch))
+            test_predictions.append(np.array(y_batch_predicted.data))
+        test_accuracies = accuracy(test_predictions, test_true)
+        print("##############################################")
+        print("Test Loss:\t{:.4f}".format(test_loss))
+        print("Test Accuracy:\t{:.4f}".format(test_accuracies))
+        print("##############################################")
+        return test_loss, test_accuracies
 
 if __name__ == "__main__":
-    run_config(0.001, 0.)
-    x, cost, _ = fmin_smac(func=run_config,
-                        x0=[-3, -4],
-                        bounds=[(1e-9, 1.), (0., 1)],
-                        maxfun=50,
-                        rng=3)  # Passing a seed makes fmin_smac determistic
+    import logging
+    logging.basicConfig(level=logging.WARNING)
 
-    print("Best x: %s; with cost: %f"% (str(x), cost))
-    pass
+    kmnist = KMNIST(train=False)
+    s = smaced()
+    cs = ConfigurationSpace()
+
+    lr = UniformFloatHyperparameter("lr", 1e-9, 1., default_value=0.001)
+    cs.add_hyperparameter(lr)
+    dp = UniformFloatHyperparameter("dropout_p", 1e-9, 1., default_value=0.1)
+    cs.add_hyperparameter(dp)
+
+    scenario = Scenario({"run_obj": "quality",   # we optimize quality (alternatively runtime)
+                         "runcount-limit": 30,  # maximum function evaluations
+                         "cs": cs,               # configuration space
+                         "deterministic": "true"
+                        })
+
+    smac = SMAC(scenario=scenario, rng=np.random.RandomState(42),
+        tae_runner=s.run_smac_config)
+    incumbent = smac.optimize()
+    s.test(kmnist)

@@ -333,3 +333,6 @@ desktop.ini
 
 # Visual Studio Code
 .vscode/
+
+# SMAC
+smac3-output_*
