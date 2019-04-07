@@ -336,3 +336,6 @@ desktop.ini
 
 # SMAC
 smac3-output_*
+
+#KMNIST Data
+kmnist*.npz

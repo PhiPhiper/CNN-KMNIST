@@ -355,6 +355,7 @@ if __name__ == "__main__":
 
     kmnist = KMNIST(train=False)
     s = smaced()
+    #s.run_config(0.001, 0.1)
     cs = ConfigurationSpace()
 
     lr = UniformFloatHyperparameter("lr", 1e-9, 1., default_value=0.001)
