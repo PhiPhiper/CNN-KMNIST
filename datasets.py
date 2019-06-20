@@ -23,20 +23,11 @@ from collections import deque
 from typing import Iterable, List, Optional, Tuple, Callable
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from apex import amp
 
 import matplotlib.pyplot as plt
 import torchvision
 
-# Import ConfigSpace and different types of parameters
-from smac.configspace import ConfigurationSpace
-from ConfigSpace.hyperparameters import CategoricalHyperparameter, \
-    UniformFloatHyperparameter, UniformIntegerHyperparameter
-from ConfigSpace.conditions import InCondition
-
-# Import SMAC-utilities
-from smac.tae.execute_func import ExecuteTAFuncDict
-from smac.scenario.scenario import Scenario
-from smac.facade.smac_facade import SMAC
 
 class KMNIST(Dataset):
     """
@@ -215,7 +206,7 @@ def accuracy(y_predicted, y_true, y_true_is_onehot: bool = False) -> float:
              else np.array(y_true).reshape(-1)
     return np.sum(np.equal(y_true, y_predicted)) / len(y_true)
 
-def train(model, loss_fn, optimizer, trainset, valset, batchsize):
+def train(model, loss_fn, optimizer, trainset, valset, batchsize, mp=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     train_loader = DataLoader(trainset, batch_size=batchsize, pin_memory=True, shuffle=True)
@@ -253,13 +244,16 @@ def train(model, loss_fn, optimizer, trainset, valset, batchsize):
 
             y_batch_predicted = model(x_batch)
             loss = loss_fn(y_batch_predicted, y_batch)
-
-            loss.backward()
+            if mp:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
             optimizer.step()
 
             train_loss[epoch - 1] += float(loss)
-            training_true.append(np.array(y_batch))
-            training_predictions.append(np.array(y_batch_predicted.data))
+            training_true.append(np.array(y_batch.cpu()))
+            training_predictions.append(np.array(y_batch_predicted.data.cpu()))
         train_accuracies[epoch - 1] = accuracy(training_predictions, training_true)
 
 
@@ -274,8 +268,8 @@ def train(model, loss_fn, optimizer, trainset, valset, batchsize):
             loss = loss_fn(y_batch_predicted, y_batch)
 
             val_loss[epoch - 1] += float(loss)
-            val_true.append(np.array(y_batch))
-            val_predictions.append(np.array(y_batch_predicted.data))
+            val_true.append(np.array(y_batch.cpu()))
+            val_predictions.append(np.array(y_batch_predicted.data.cpu()))
         val_accuracies[epoch - 1] = accuracy(val_predictions, val_true)
 
         print("  Training Loss:\t{:.4f}".format(train_loss[epoch - 1]))
@@ -303,7 +297,7 @@ class smaced():
     def run_smac_config(self, cfg):
         return self.run_config(**cfg)
 
-    def run_config(self, lr, dropout_p):
+    def run_config(self, lr, dropout_p, mp=False):
         # Define dataset
         kmnist = KMNIST()
         # Define the network params
@@ -314,10 +308,12 @@ class smaced():
         # Define loss and optimizer
         optimizer = optim.Adam(myCNN.parameters(), lr=lr)
 
+        if mp:
+            myCNN, optimizer = amp.initialize(myCNN, optimizer, opt_level="O1")
 
         # Split data
         trainset, valset, testset = torch.utils.data.random_split(kmnist, split_ratio_to_lengths(len(kmnist), (.7, .15, .15)))
-        tl, ta, vl, va = train(myCNN, self.criterion, optimizer, trainset, valset, 500) # <- 1000 was too big for my 8GB GPU
+        tl, ta, vl, va = train(myCNN, self.criterion, optimizer, trainset, valset, 500, mp) # <- 1000 was too big for my 8GB GPU
         if (1-va[-1]) < self.min_validationerror:
             self.min_validationerror = (1-va[-1])
             self.saved_model = myCNN
@@ -340,8 +336,8 @@ class smaced():
             loss = self.criterion(y_batch_predicted, y_batch)
 
             test_loss += float(loss)
-            test_true.append(np.array(y_batch))
-            test_predictions.append(np.array(y_batch_predicted.data))
+            test_true.append(np.array(y_batch.cpu()))
+            test_predictions.append(np.array(y_batch_predicted.data.cpu()))
         test_accuracies = accuracy(test_predictions, test_true)
         print("##############################################")
         print("Test Loss:\t{:.4f}".format(test_loss))
@@ -355,21 +351,7 @@ if __name__ == "__main__":
 
     kmnist = KMNIST(train=False)
     s = smaced()
-    #s.run_config(0.001, 0.1)
-    cs = ConfigurationSpace()
+    s.run_config(0.001, 0.1)
 
-    lr = UniformFloatHyperparameter("lr", 1e-9, 1., default_value=0.001)
-    cs.add_hyperparameter(lr)
-    dp = UniformFloatHyperparameter("dropout_p", 1e-9, 1., default_value=0.1)
-    cs.add_hyperparameter(dp)
-
-    scenario = Scenario({"run_obj": "quality",   # we optimize quality (alternatively runtime)
-                         "runcount-limit": 30,  # maximum function evaluations
-                         "cs": cs,               # configuration space
-                         "deterministic": "true"
-                        })
-
-    smac = SMAC(scenario=scenario, rng=np.random.RandomState(42),
-        tae_runner=s.run_smac_config)
-    incumbent = smac.optimize()
-    s.test(kmnist)
+    s = smaced()
+    s.run_config(0.001, 0.1, mp=True)
